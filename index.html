@@ -240,6 +240,15 @@ body{
 .switch.off{ background:#E0D5C8; }
 .switch.off::after{ right:auto; left:2px; }
 
+/* 数据备份卡 */
+.backup-card{ margin:12px 12px 0; background:#fff; border-radius:14px; padding:11px 12px; box-shadow:0 3px 8px rgba(184,150,110,.1); display:flex; align-items:center; gap:10px; }
+.backup-card .bk-t{ font-size:12.5px; font-weight:bold; }
+.backup-card .bk-s{ font-size:10px; color:var(--sub); margin-top:3px; line-height:1.5; }
+.bk-btns{ display:flex; gap:6px; flex-shrink:0; }
+.bk-btn{ font-family:inherit; font-size:11.5px; font-weight:bold; padding:7px 13px; border-radius:16px; border:none; cursor:pointer; background:linear-gradient(135deg,var(--orange),var(--orange-d)); color:#fff; box-shadow:0 3px 8px rgba(255,110,64,.3); }
+.bk-btn.ghost{ background:#FFF3E4; color:#D87A4B; box-shadow:none; border:1.5px solid #FFD9C2; }
+.bk-btn:active{ transform:scale(.96); }
+
 /* 添加/编辑菜品表单 */
 .upload-box{
   height:92px; border:2px dashed #FFB74D; border-radius:14px; background:#FFF3E4;
@@ -342,6 +351,17 @@ body{
         <div class="s" id="mgmt-sub"></div>
       </div>
       <button class="mgmt-add" id="btn-add-dish">＋ 添加菜品</button>
+    </div>
+    <div class="backup-card">
+      <div style="flex:1;min-width:0">
+        <div class="bk-t">💾 数据备份</div>
+        <div class="bk-s" id="bk-sub">导出文件存到网盘或微信收藏，换设备时导入即可</div>
+      </div>
+      <div class="bk-btns">
+        <button class="bk-btn" id="btn-export">导出</button>
+        <button class="bk-btn ghost" id="btn-import">导入</button>
+      </div>
+      <input type="file" id="file-import" accept=".json,application/json" style="display:none">
     </div>
     <div class="mgmt-body" id="mgmt-list"></div>
   </div>
@@ -454,6 +474,59 @@ function load(){
   return { dishes:seedDishes(), cart:[], history:[], luckyLog:[], curMeal:"wu" };
 }
 function save(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+
+/* ================= 备份 / 恢复（本地文件，不联网） ================= */
+const BK_KEY = "ganfan_backup_at";
+function renderBackupInfo(){
+  const el = $("#bk-sub"); if(!el) return;
+  const v = localStorage.getItem(BK_KEY);
+  if(v){
+    const d = new Date(v);
+    const p = n => String(n).padStart(2,"0");
+    el.textContent = "上次导出 "+p(d.getMonth()+1)+"/"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())+" · 换设备时导入即可";
+  }else{
+    el.textContent = "导出文件存到网盘或微信收藏，换设备时导入即可";
+  }
+}
+function exportBackup(){
+  try{
+    const payload = { app:"ganfan-xiaopu", version:1, exportedAt:new Date().toISOString(), data:state };
+    const blob = new Blob([JSON.stringify(payload)], { type:"application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "干饭小铺备份-"+todayStr()+".json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+    localStorage.setItem(BK_KEY, new Date().toISOString());
+    renderBackupInfo();
+    toast("备份文件已生成 📄");
+  }catch(e){ toast("导出失败："+e.message); }
+}
+function importBackup(file){
+  if(!file) return;
+  if(file.size > 8*1024*1024){ toast("文件太大，可能不是备份文件"); return; }
+  const reader = new FileReader();
+  reader.onerror = ()=>toast("读取文件失败");
+  reader.onload = ()=>{
+    let obj = null;
+    try{ obj = JSON.parse(String(reader.result)); }catch(e){}
+    const d = obj && obj.data ? obj.data : obj;
+    if(!d || !Array.isArray(d.dishes) || d.dishes.length===0){ toast("不是有效的备份文件"); return; }
+    const days = Array.isArray(d.history) ? d.history.length : 0;
+    if(!confirm("导入后将替换当前全部数据。\n\n文件内容：菜品 "+d.dishes.length+" 道 · 吃饭记录 "+days+" 天\n\n确定继续吗？")) return;
+    state = {
+      dishes: d.dishes,
+      cart: Array.isArray(d.cart) ? d.cart : [],
+      history: Array.isArray(d.history) ? d.history : [],
+      luckyLog: Array.isArray(d.luckyLog) ? d.luckyLog : [],
+      curMeal: d.curMeal || "wu"
+    };
+    save();
+    renderMenu(); renderCartBar(); renderLuckyHist(); renderHistory(); renderManage();
+    toast("导入成功 ✅");
+  };
+  reader.readAsText(file);
+}
 
 /* ================= 工具 ================= */
 const $ = s => document.querySelector(s);
@@ -791,6 +864,14 @@ $("#mgmt-list").addEventListener("click",e=>{
 });
 $("#btn-add-dish").addEventListener("click",()=>openForm(null));
 
+/* 备份按钮 */
+$("#btn-export").addEventListener("click", exportBackup);
+$("#btn-import").addEventListener("click", ()=>$("#file-import").click());
+$("#file-import").addEventListener("change", e=>{
+  importBackup(e.target.files && e.target.files[0]);
+  e.target.value = "";
+});
+
 function openForm(id){
   formEditId=id;
   const d=id?state.dishes.find(x=>x.id===id):null;
@@ -870,7 +951,7 @@ $("#form-save").addEventListener("click",()=>{
 });
 
 /* ================= 启动 ================= */
-renderMenu(); renderCartBar(); renderLuckyHist();
+renderMenu(); renderCartBar(); renderLuckyHist(); renderBackupInfo();
 $("#cat-list").innerHTML=[...new Set(state.dishes.map(d=>d.cat).filter(Boolean))].map(c=>'<option value="'+esc(c)+'">').join("");
 </script>
 </body>
