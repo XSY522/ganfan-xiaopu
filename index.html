@@ -279,11 +279,43 @@ body{
   color:#fff; font-size:14px; padding:12px 22px; border-radius:20px; z-index:99; opacity:0;
   transition:.25s; pointer-events:none; white-space:nowrap; max-width:86vw;
 }
-#toast.on{ opacity:1; transform:translateX(-50%) scale(1); }
+#toast.on{ opacity:1; transform:translateX(-50%) scale(1); }/* 同步状态徽标 */
+#sync-pill{
+  position:absolute; top:10px; right:12px; z-index:60; font-size:10px; font-weight:bold;
+  padding:4px 9px; border-radius:12px; background:rgba(255,255,255,.9); color:#8D6E63;
+  box-shadow:0 2px 6px rgba(0,0,0,.12); display:none; max-width:150px; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis;
+}
+#sync-pill.on{ display:block; }
+#sync-pill.ok{ color:#2E7D32; background:#E8F5E9; }
+#sync-pill.sync{ color:#E65100; background:#FFF3E0; }
+#sync-pill.err{ color:#C62828; background:#FFEBEE; }
+
+/* 登录门 */
+#auth-gate{
+  position:fixed; inset:0; z-index:200; background:linear-gradient(160deg,#FFE0B2,#FFCCBC);
+  display:none; align-items:center; justify-content:center; padding:18px;
+}
+#auth-gate.on{ display:flex; }
+.auth-card{
+  width:100%; max-width:360px; background:#FFF9F0; border-radius:22px; padding:26px 22px;
+  box-shadow:0 18px 50px rgba(120,80,50,.28); text-align:center;
+}
+.auth-logo{ font-size:44px; line-height:1; }
+.auth-t{ font-size:19px; font-weight:bold; margin-top:8px; }
+.auth-s{ font-size:11.5px; color:var(--sub); margin:6px 0 18px; line-height:1.7; }
+.auth-card .finput{ width:100%; margin-bottom:9px; text-align:left; }
+.auth-btn{ width:100%; padding:12px 0; font-size:14px; margin-top:4px; }
+.auth-link{ font-size:12px; color:var(--orange-d); margin-top:14px; cursor:pointer; text-decoration:underline; }
+.auth-skip{ font-size:11px; color:var(--sub); margin-top:12px; cursor:pointer; }
+.auth-msg{ font-size:11.5px; color:#C62828; margin-top:10px; min-height:16px; line-height:1.6; }
+.auth-msg.ok{ color:#2E7D32; }
+
 </style>
 </head>
 <body>
 <div id="app">
+  <div id="sync-pill">☁️ 未连接</div>
 
   <!-- ============ 菜单页 ============ -->
   <div class="view on" id="view-menu">
@@ -433,8 +465,23 @@ body{
   <button class="btn-primary sheet-save" id="form-save">保存菜品 ✅</button>
 </div>
 
+<div id="auth-gate">
+  <div class="auth-card">
+    <div class="auth-logo">🍚</div>
+    <div class="auth-t">干饭小铺</div>
+    <div class="auth-s">登录后，手机和电脑共用同一份菜单与吃饭记录<br>在一台设备上改动，其他设备自动同步</div>
+    <input class="finput" id="auth-email" type="email" placeholder="邮箱" autocomplete="username">
+    <input class="finput" id="auth-pass" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password">
+    <button class="btn-primary auth-btn" id="auth-login">登 录</button>
+    <div class="auth-link" id="auth-toggle">没有账号？点这里注册</div>
+    <div class="auth-msg" id="auth-msg"></div>
+    <div class="auth-skip" id="auth-skip">先不登录，只用本机（不同步）</div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 /* ================= 数据 ================= */
 const LS_KEY = "ganfan_app_v1";
@@ -473,7 +520,7 @@ function load(){
   }catch(e){}
   return { dishes:seedDishes(), cart:[], history:[], luckyLog:[], curMeal:"wu" };
 }
-function save(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+function save(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); queuePush(); }
 
 /* ================= 备份 / 恢复（本地文件，不联网） ================= */
 const BK_KEY = "ganfan_backup_at";
@@ -953,6 +1000,168 @@ $("#form-save").addEventListener("click",()=>{
 /* ================= 启动 ================= */
 renderMenu(); renderCartBar(); renderLuckyHist(); renderBackupInfo();
 $("#cat-list").innerHTML=[...new Set(state.dishes.map(d=>d.cat).filter(Boolean))].map(c=>'<option value="'+esc(c)+'">').join("");
+
+/* ================= 云同步（Supabase） ================= */
+const SB_URL = "https://qxaavxxradkflvyqzqrp.supabase.co";
+const SB_KEY = "sb_publishable_5IUW5cIXxlVJ3lNJm9fXLw_FDjWgcd3";
+const S_TABLE = "app_state";
+let sb = null;
+try{
+  if(window.supabase) sb = window.supabase.createClient(SB_URL, SB_KEY, {
+    auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:false }
+  });
+}catch(e){ console.warn("supabase init failed", e); }
+
+const SYNC = { user:null, ready:false, applying:false, pending:false, timer:null, lastServerAt:0, polling:null };
+
+function pill(text, cls){
+  const el = $("#sync-pill"); if(!el) return;
+  if(!text){ el.className = ""; el.style.display = "none"; return; }
+  el.textContent = text;
+  el.className = "on " + (cls||"");
+  el.style.display = "";
+}
+
+function queuePush(){
+  if(!SYNC.ready || SYNC.applying || !sb || !SYNC.user) return;
+  SYNC.pending = true;
+  pill("⏳ 同步中", "sync");
+  clearTimeout(SYNC.timer);
+  SYNC.timer = setTimeout(()=>pushRemote(), 900);
+}
+
+async function pushRemote(){
+  if(!sb || !SYNC.user) return;
+  const row = { user_id: SYNC.user.id, data: state, updated_at: new Date().toISOString() };
+  const { error } = await sb.from(S_TABLE).upsert(row, { onConflict:"user_id" });
+  if(error){ pill("⚠️ 同步失败", "err"); console.warn("push failed", error); return; }
+  SYNC.pending = false;
+  SYNC.lastServerAt = new Date(row.updated_at).getTime();
+  pill("☁️ 已同步", "ok");
+}
+
+async function pullRemote(first){
+  if(!sb || !SYNC.user || SYNC.pending) return;
+  const { data, error } = await sb.from(S_TABLE)
+    .select("data,updated_at").eq("user_id", SYNC.user.id).maybeSingle();
+  if(error){ pill("⚠️ 同步失败", "err"); console.warn("pull failed", error); return; }
+  if(!data){ SYNC.ready = true; await pushRemote(); return; }
+  const at = new Date(data.updated_at).getTime();
+  if(first){
+    SYNC.ready = true;
+    SYNC.lastServerAt = at;
+    applyRemote(data.data, true);
+    return;
+  }
+  if(at > SYNC.lastServerAt + 800){
+    SYNC.lastServerAt = at;
+    applyRemote(data.data, false);
+    pill("☁️ 已更新", "ok");
+  }
+}
+
+function applyRemote(d, first){
+  if(!d || !Array.isArray(d.dishes) || !d.dishes.length) return;
+  const rDays = Array.isArray(d.history) ? d.history.length : 0;
+  if(first && Array.isArray(state.dishes) && state.dishes.length){
+    const same = state.dishes.length === d.dishes.length && (state.history||[]).length === rDays;
+    if(!same){
+      const useRemote = confirm("云端已有数据：菜品 "+d.dishes.length+" 道 · 记录 "+rDays+" 天。\n\n【确定】用云端覆盖本机\n【取消】把本机数据上传覆盖云端");
+      if(!useRemote){ pushRemote(); return; }
+    }
+  }
+  SYNC.applying = true;
+  state = {
+    dishes: d.dishes,
+    cart: Array.isArray(d.cart) ? d.cart : [],
+    history: Array.isArray(d.history) ? d.history : [],
+    luckyLog: Array.isArray(d.luckyLog) ? d.luckyLog : [],
+    curMeal: d.curMeal || "wu"
+  };
+  localStorage.setItem(LS_KEY, JSON.stringify(state));
+  renderMenu(); renderCartBar(); renderLuckyHist(); renderHistory(); renderManage(); renderBackupInfo();
+  SYNC.applying = false;
+  pill("☁️ 已同步", "ok");
+}
+
+/* ---- 登录界面 ---- */
+let authMode = "login";
+function gateMsg(t, ok){
+  const el = $("#auth-msg"); el.textContent = t || ""; el.className = "auth-msg" + (ok?" ok":"");
+}
+function showGate(){ $("#auth-gate").classList.add("on"); }
+function hideGate(){ $("#auth-gate").classList.remove("on"); }
+function setAuthMode(m){
+  authMode = m;
+  $("#auth-login").textContent = m==="login" ? "登 录" : "注 册";
+  $("#auth-toggle").textContent = m==="login" ? "没有账号？点这里注册" : "已有账号？点这里登录";
+  gateMsg("");
+}
+async function handleAuth(){
+  if(!sb){ gateMsg("云端组件加载失败，请检查网络后刷新页面"); return; }
+  const email = ($("#auth-email").value||"").trim();
+  const pass = $("#auth-pass").value||"";
+  if(!email || email.indexOf("@")<0){ gateMsg("请填写正确的邮箱"); return; }
+  if(pass.length < 6){ gateMsg("密码至少 6 位"); return; }
+  $("#auth-login").disabled = true;
+  gateMsg("处理中…", true);
+  try{
+    if(authMode === "login"){
+      const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
+      if(error) throw error;
+      if(data && data.session){
+        SYNC.user = data.session.user; SYNC.ready = true;
+        hideGate(); await pullRemote(true); startPolling();
+      }
+    }else{
+      const { data, error } = await sb.auth.signUp({ email, password: pass });
+      if(error) throw error;
+      if(data && data.session){
+        SYNC.user = data.session.user; SYNC.ready = true;
+        hideGate(); await pullRemote(true); startPolling();
+      }else{
+        gateMsg("注册成功，请到邮箱点确认链接后再登录", true);
+      }
+    }
+  }catch(e){
+    gateMsg((e && e.message) ? e.message : "操作失败，请重试");
+  }finally{
+    $("#auth-login").disabled = false;
+  }
+}
+$("#auth-login").addEventListener("click", handleAuth);
+$("#auth-pass").addEventListener("keydown", e=>{ if(e.key==="Enter") handleAuth(); });
+$("#auth-toggle").addEventListener("click", ()=>setAuthMode(authMode==="login"?"signup":"login"));
+$("#auth-skip").addEventListener("click", ()=>{ hideGate(); pill("📴 仅本机", "err"); });
+
+function startPolling(){
+  if(SYNC.polling) return;
+  SYNC.polling = setInterval(()=>{
+    if(document.visibilityState === "visible") pullRemote(false);
+  }, 12000);
+}
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState === "visible") pullRemote(false);
+});
+window.addEventListener("online", ()=>pullRemote(false));
+
+(async function initSync(){
+  if(!sb){ pill("📴 离线", "err"); return; }
+  try{
+    const { data } = await sb.auth.getSession();
+    const s = data && data.session;
+    if(s && s.user){
+      SYNC.user = s.user; SYNC.ready = true;
+      hideGate(); pill("☁️ 连接中", "sync");
+      await pullRemote(true);
+      startPolling();
+    }else{
+      showGate(); pill("☁️ 未登录", "");
+    }
+  }catch(e){
+    showGate(); pill("📴 离线", "err");
+  }
+})();
 </script>
 </body>
 </html>
